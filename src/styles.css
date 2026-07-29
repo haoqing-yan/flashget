@@ -73,6 +73,8 @@ header p, .dialog-head p { color: #8791a4; margin: 0; font-size: 13px; }
 .input-icon { position: relative; }
 .input-icon svg { position: absolute; left: 12px; top: 11px; color: #8b96a9; }
 .input-icon input { padding-left: 39px !important; }
+.directory-input { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.directory-input button { border: 0; border-radius: 9px; padding: 0 15px; color: #3972f6; background: #e8efff; font-weight: 600; }
 input[type="range"] { accent-color: #3972f6; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; padding-top: 4px; }
 .torrent-dialog { width: min(680px, 100%); max-height: calc(100vh - 48px); overflow: hidden; }

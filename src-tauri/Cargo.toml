@@ -1,6 +1,6 @@
 [package]
 name = "flashget"
-version = "0.1.2"
+version = "0.1.3"
 description = "A fast cross-platform download manager"
 authors = ["FlashGet Contributors"]
 edition = "2021"

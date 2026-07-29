@@ -117,6 +117,19 @@ function App() {
     }
   }
 
+  async function chooseDownloadDirectory() {
+    if (!inTauri) {
+      alert("请在 Tauri 桌面应用中选择下载目录。");
+      return;
+    }
+    const path = await open({
+      title: "选择下载目录",
+      multiple: false,
+      directory: true
+    });
+    if (path) setDestination(path);
+  }
+
   async function chooseTorrent() {
     if (!inTauri) {
       alert("请在 Tauri 桌面应用中选择种子文件。");
@@ -134,7 +147,7 @@ function App() {
       await invoke<TorrentMetadata>("parse_torrent", { path });
       const task = await invoke<DownloadTask>("create_torrent_download", {
         path,
-        destination: null
+        destination: destination.trim() || null
       });
       setTasks((current) => [task, ...current]);
     } catch (error) {
@@ -172,6 +185,7 @@ function App() {
             <p>高速、安静地完成每一次下载</p>
           </div>
           <div className="header-actions">
+            <button className="secondary" onClick={chooseDownloadDirectory}><FolderOpen size={19} />下载目录</button>
             <button className="secondary" onClick={chooseTorrent} disabled={parsingTorrent}><FileArchive size={19} />{parsingTorrent ? "正在添加…" : "添加种子"}</button>
             <button className="primary" onClick={() => setShowDialog(true)}><Plus size={19} />新建任务</button>
           </div>
@@ -226,7 +240,7 @@ function App() {
           <form className="dialog" onSubmit={createTask} onMouseDown={(event) => event.stopPropagation()}>
             <div className="dialog-head"><div><h2>新建下载任务</h2><p>支持 HTTP/HTTPS 与断点续传</p></div><button type="button" className="icon-button" onClick={() => setShowDialog(false)}><X size={19} /></button></div>
             <label>下载链接<textarea autoFocus value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/file.zip" required /></label>
-            <label>保存目录（留空使用系统下载目录）<div className="input-icon"><FolderOpen size={18} /><input value={destination} onChange={(event) => setDestination(event.target.value)} placeholder="默认下载目录" /></div></label>
+            <label>保存目录（留空使用系统下载目录）<div className="input-icon directory-input"><FolderOpen size={18} /><input value={destination} onChange={(event) => setDestination(event.target.value)} placeholder="默认下载目录" /><button type="button" onClick={chooseDownloadDirectory}>选择</button></div></label>
             <label>并发连接数 <strong>{connections}</strong><input type="range" min="1" max="32" value={connections} onChange={(event) => setConnections(Number(event.target.value))} /></label>
             <div className="dialog-actions"><button type="button" className="secondary" onClick={() => setShowDialog(false)}>取消</button><button className="primary" type="submit"><Download size={18} />立即下载</button></div>
           </form>
