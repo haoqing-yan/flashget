@@ -4,9 +4,12 @@ use crate::{
     state::{ManagedTask, Manager},
 };
 use lava_torrent::torrent::v1::Torrent;
-use librqbit::{AddTorrent, AddTorrentOptions, Session, SessionOptions};
+use librqbit::{AddTorrent, AddTorrentOptions, Session, SessionOptions, TorrentStatsState};
 use librqbit_dht::PersistentDhtConfig;
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use tauri::{AppHandle, State};
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
@@ -126,13 +129,37 @@ pub(crate) async fn create_torrent_download(
 
     let manager = manager.inner().clone();
     tauri::async_runtime::spawn(async move {
+        let mut last_fetched: Option<(u64, Instant)> = None;
+        let mut smoothed_speed = 0;
         loop {
             let stats = handle.stats();
-            let speed = stats
-                .live
-                .as_ref()
+            let now = Instant::now();
+            let live = stats.live.as_ref();
+            let engine_speed = live
                 .map(|live| (live.download_speed.mbps * 1024.0 * 1024.0) as u64)
                 .unwrap_or(0);
+            let fetched = live.map(|live| live.snapshot.fetched_bytes).unwrap_or(0);
+            let measured_speed = if live.is_some() {
+                let measured = last_fetched
+                    .map(|(previous, sampled_at)| {
+                        let elapsed = now.duration_since(sampled_at).as_secs_f64();
+                        if elapsed > 0.0 {
+                            (fetched.saturating_sub(previous) as f64 / elapsed) as u64
+                        } else {
+                            0
+                        }
+                    })
+                    .unwrap_or(0);
+                last_fetched = Some((fetched, now));
+                measured
+            } else {
+                last_fetched = None;
+                smoothed_speed = 0;
+                0
+            };
+            smoothed_speed = smooth_speed(smoothed_speed, measured_speed.max(engine_speed));
+            let initializing = matches!(stats.state, TorrentStatsState::Initializing);
+            let speed = if initializing { 0 } else { smoothed_speed };
             let (peers_connected, peers_seen) = stats
                 .live
                 .as_ref()
@@ -151,6 +178,8 @@ pub(crate) async fn create_torrent_download(
                 "failed"
             } else if handle.is_paused() {
                 "paused"
+            } else if initializing {
+                "checking"
             } else {
                 "downloading"
             };
@@ -207,6 +236,14 @@ async fn get_or_create_session(
     Ok(session)
 }
 
+fn smooth_speed(previous: u64, current: u64) -> u64 {
+    match (previous, current) {
+        (0, current) => current,
+        (previous, 0) => previous.saturating_mul(3) / 4,
+        (previous, current) => ((previous as f64 * 0.65) + (current as f64 * 0.35)).round() as u64,
+    }
+}
+
 fn safe_folder_name(name: &str, info_hash: &str) -> String {
     let sanitized: String = name
         .chars()
@@ -233,7 +270,7 @@ fn safe_folder_name(name: &str, info_hash: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_folder_name;
+    use super::{safe_folder_name, smooth_speed};
 
     #[test]
     fn sanitizes_cross_platform_folder_names() {
@@ -246,5 +283,12 @@ mod tests {
     #[test]
     fn falls_back_when_name_has_no_usable_characters() {
         assert_eq!(safe_folder_name("... ", "1234567890"), "torrent-12345678");
+    }
+
+    #[test]
+    fn smooths_measured_download_speed() {
+        assert_eq!(smooth_speed(0, 10_000), 10_000);
+        assert_eq!(smooth_speed(10_000, 20_000), 13_500);
+        assert_eq!(smooth_speed(10_000, 0), 7_500);
     }
 }

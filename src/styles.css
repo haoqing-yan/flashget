@@ -49,6 +49,7 @@ header p, .dialog-head p { color: #8791a4; margin: 0; font-size: 13px; }
 .task-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
 .task-title span { flex: none; font-size: 11px; color: #758096; }
 .task-title .downloading { color: #3972f6; }
+.task-title .checking { color: #8b5cf6; }
 .task-title .completed { color: #25a670; }
 .task-title .failed { color: #dc5353; }
 .progress { height: 5px; border-radius: 4px; background: #eef1f6; overflow: hidden; }

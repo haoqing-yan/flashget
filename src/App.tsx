@@ -30,6 +30,7 @@ function formatBytes(value: number) {
 function statusText(status: TaskStatus) {
   return {
     queued: "等待中",
+    checking: "正在校验",
     downloading: "下载中",
     paused: "已暂停",
     completed: "已完成",
@@ -79,7 +80,7 @@ function App() {
   }, []);
 
   const stats = useMemo(() => {
-    const active = tasks.filter((task) => task.status === "downloading");
+    const active = tasks.filter((task) => task.status === "downloading" || task.status === "checking");
     return {
       active: active.length,
       completed: tasks.filter((task) => task.status === "completed").length,
@@ -187,6 +188,7 @@ function App() {
           <div className="task-list">
             {tasks.map((task) => {
               const progress = task.total ? Math.min(100, task.downloaded / task.total * 100) : 0;
+              const active = task.status === "downloading" || task.status === "checking";
               return (
                 <article className="task" key={task.id}>
                   <div className={`file-icon ${task.status}`}><Download size={22} /></div>
@@ -207,10 +209,10 @@ function App() {
                       {task.error && <span className="error">{task.error}</span>}
                     </div>
                   </div>
-                  <button className="icon-button" title={task.status === "downloading" ? "暂停" : "继续"}
+                  <button className="icon-button" title={active ? "暂停" : "继续"}
                     disabled={task.status === "completed"}
-                    onClick={() => control(task.id, task.status === "downloading" ? "pause" : "resume")}>
-                    {task.status === "downloading" ? <Pause size={18} /> : task.status === "failed" ? <RotateCcw size={18} /> : <Play size={18} />}
+                    onClick={() => control(task.id, active ? "pause" : "resume")}>
+                    {active ? <Pause size={18} /> : task.status === "failed" ? <RotateCcw size={18} /> : <Play size={18} />}
                   </button>
                 </article>
               );

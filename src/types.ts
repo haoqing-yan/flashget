@@ -1,5 +1,6 @@
 export type TaskStatus =
   | "queued"
+  | "checking"
   | "downloading"
   | "paused"
   | "completed"
