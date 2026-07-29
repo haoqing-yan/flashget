@@ -13,12 +13,15 @@ import {
   Pause,
   Play,
   Plus,
+  Power,
   RotateCcw,
+  Trash2,
   X
 } from "lucide-react";
 import type { DownloadTask, ProgressPayload, TaskStatus, TorrentMetadata } from "./types";
 
 const inTauri = "__TAURI_INTERNALS__" in window;
+type TaskFilter = "all" | "active" | "completed";
 
 function formatBytes(value: number) {
   if (!value) return "0 B";
@@ -63,30 +66,52 @@ function App() {
   const [destination, setDestination] = useState("");
   const [connections, setConnections] = useState(16);
   const [parsingTorrent, setParsingTorrent] = useState(false);
+  const [taskFilter, setTaskFilter] = useState<TaskFilter>("all");
+  const [shutdownWhenDone, setShutdownWhenDone] = useState(false);
+  const [shutdownNotice, setShutdownNotice] = useState("");
 
   useEffect(() => {
     if (!inTauri) return;
     invoke<DownloadTask[]>("list_tasks").then(setTasks).catch(console.error);
-    const unlisten = listen<ProgressPayload>("download-progress", ({ payload }) => {
+    invoke<boolean>("get_shutdown_when_done").then(setShutdownWhenDone).catch(console.error);
+    const progressListener = listen<ProgressPayload>("download-progress", ({ payload }) => {
       setTasks((current) =>
         current.map((task) =>
           task.id === payload.id ? { ...task, ...payload } : task
         )
       );
     });
+    const shutdownListener = listen<number>("shutdown-scheduled", ({ payload }) => {
+      setShutdownNotice(`所有任务已完成，将在 ${payload} 秒后关闭计算机。关闭下方开关可取消。`);
+    });
+    const shutdownErrorListener = listen<string>("shutdown-error", ({ payload }) => {
+      setShutdownNotice(payload);
+    });
     return () => {
-      unlisten.then((fn) => fn());
+      progressListener.then((fn) => fn());
+      shutdownListener.then((fn) => fn());
+      shutdownErrorListener.then((fn) => fn());
     };
   }, []);
 
   const stats = useMemo(() => {
-    const active = tasks.filter((task) => task.status === "downloading" || task.status === "checking");
+    const active = tasks.filter((task) => task.status !== "completed");
     return {
       active: active.length,
       completed: tasks.filter((task) => task.status === "completed").length,
-      speed: active.reduce((sum, task) => sum + task.speed, 0)
+      speed: active.reduce((sum, task) => sum + task.speed, 0),
     };
   }, [tasks]);
+
+  const visibleTasks = useMemo(() => {
+    if (taskFilter === "active") {
+      return tasks.filter((task) => task.status !== "completed");
+    }
+    if (taskFilter === "completed") {
+      return tasks.filter((task) => task.status === "completed");
+    }
+    return tasks;
+  }, [taskFilter, tasks]);
 
   async function createTask(event: React.FormEvent) {
     event.preventDefault();
@@ -112,6 +137,13 @@ function App() {
   async function control(id: string, action: "pause" | "resume") {
     try {
       await invoke(action === "pause" ? "pause_download" : "resume_download", { id });
+      setTasks((current) =>
+        current.map((task) =>
+          task.id === id
+            ? { ...task, status: action === "pause" ? "paused" : "downloading", speed: 0, etaSeconds: null }
+            : task
+        )
+      );
     } catch (error) {
       alert(String(error));
     }
@@ -144,16 +176,50 @@ function App() {
     if (!path) return;
     setParsingTorrent(true);
     try {
-      await invoke<TorrentMetadata>("parse_torrent", { path });
+      const metadata = await invoke<TorrentMetadata>("parse_torrent", { path });
+      const selectedDirectory = await open({
+        title: `选择“${metadata.name}”的保存目录`,
+        multiple: false,
+        directory: true,
+        defaultPath: destination.trim() || undefined
+      });
+      if (!selectedDirectory) return;
+      const torrentDestination = Array.isArray(selectedDirectory)
+        ? selectedDirectory[0]
+        : selectedDirectory;
+      if (!torrentDestination) return;
+      setDestination(torrentDestination);
       const task = await invoke<DownloadTask>("create_torrent_download", {
         path,
-        destination: destination.trim() || null
+        destination: torrentDestination
       });
-      setTasks((current) => [task, ...current]);
+      setTasks((current) => [task, ...current.filter((item) => item.url !== path)]);
     } catch (error) {
       alert(`种子解析失败：${String(error)}`);
     } finally {
       setParsingTorrent(false);
+    }
+  }
+
+  async function deleteTask(task: DownloadTask) {
+    const confirmed = window.confirm(`确定删除任务“${task.fileName}”吗？\n已下载的文件不会被删除。`);
+    if (!confirmed) return;
+    try {
+      await invoke("delete_download", { id: task.id });
+      setTasks((current) => current.filter((item) => item.id !== task.id));
+    } catch (error) {
+      alert(String(error));
+    }
+  }
+
+  async function toggleShutdownWhenDone() {
+    const enabled = !shutdownWhenDone;
+    try {
+      await invoke("set_shutdown_when_done", { enabled });
+      setShutdownWhenDone(enabled);
+      if (!enabled) setShutdownNotice("");
+    } catch (error) {
+      alert(String(error));
     }
   }
 
@@ -167,14 +233,19 @@ function App() {
           <div><strong>闪载</strong><span>FlashGet</span></div>
         </div>
         <nav>
-          <button className="nav-item active"><HardDriveDownload size={19} />全部任务<span>{tasks.length}</span></button>
-          <button className="nav-item"><Gauge size={19} />正在下载<span>{stats.active}</span></button>
-          <button className="nav-item"><CheckCircle2 size={19} />已完成<span>{stats.completed}</span></button>
+          <button className={`nav-item ${taskFilter === "all" ? "active" : ""}`} onClick={() => setTaskFilter("all")}><HardDriveDownload size={19} />全部任务<span>{tasks.length}</span></button>
+          <button className={`nav-item ${taskFilter === "active" ? "active" : ""}`} onClick={() => setTaskFilter("active")}><Gauge size={19} />正在下载<span>{stats.active}</span></button>
+          <button className={`nav-item ${taskFilter === "completed" ? "active" : ""}`} onClick={() => setTaskFilter("completed")}><CheckCircle2 size={19} />已完成<span>{stats.completed}</span></button>
         </nav>
         <div className="sidebar-foot">
           <p>当前总速度</p>
           <strong>{formatBytes(stats.speed)}/s</strong>
           <small>多连接并行下载已启用</small>
+          <button className={`shutdown-toggle ${shutdownWhenDone ? "enabled" : ""}`} onClick={toggleShutdownWhenDone}>
+            <Power size={15} />
+            <span>全部完成后关机</span>
+            <i />
+          </button>
         </div>
       </aside>
 
@@ -191,16 +262,30 @@ function App() {
           </div>
         </header>
 
-        {tasks.length === 0 ? (
+        {destination && (
+          <div className="destination-bar">
+            <FolderOpen size={15} />
+            <span>当前保存目录：{destination}</span>
+          </div>
+        )}
+        {shutdownNotice && (
+          <div className="shutdown-notice">
+            <Power size={16} />
+            <span>{shutdownNotice}</span>
+            <button onClick={() => setShutdownNotice("")}><X size={15} /></button>
+          </div>
+        )}
+
+        {visibleTasks.length === 0 ? (
           <div className="empty">
             <div className="empty-icon"><Download size={38} /></div>
-            <h2>还没有下载任务</h2>
-            <p>粘贴一个 HTTP 或 HTTPS 链接开始下载</p>
-            <button className="primary" onClick={() => setShowDialog(true)}><Plus size={19} />添加第一个任务</button>
+            <h2>{taskFilter === "completed" ? "还没有已完成任务" : taskFilter === "active" ? "当前没有正在下载的任务" : "还没有下载任务"}</h2>
+            <p>{taskFilter === "all" ? "粘贴一个 HTTP/HTTPS 链接，或添加种子开始下载" : "可以切换到“全部任务”查看其他任务"}</p>
+            {taskFilter === "all" && <button className="primary" onClick={() => setShowDialog(true)}><Plus size={19} />添加第一个任务</button>}
           </div>
         ) : (
           <div className="task-list">
-            {tasks.map((task) => {
+            {visibleTasks.map((task) => {
               const progress = task.total ? Math.min(100, task.downloaded / task.total * 100) : 0;
               const active = task.status === "downloading" || task.status === "checking";
               return (
@@ -223,11 +308,16 @@ function App() {
                       {task.error && <span className="error">{task.error}</span>}
                     </div>
                   </div>
-                  <button className="icon-button" title={active ? "暂停" : "继续"}
-                    disabled={task.status === "completed"}
-                    onClick={() => control(task.id, active ? "pause" : "resume")}>
-                    {active ? <Pause size={18} /> : task.status === "failed" ? <RotateCcw size={18} /> : <Play size={18} />}
-                  </button>
+                  <div className="task-actions">
+                    <button className="icon-button" title={active ? "暂停" : "继续"}
+                      disabled={task.status === "completed"}
+                      onClick={() => control(task.id, active ? "pause" : "resume")}>
+                      {active ? <Pause size={18} /> : task.status === "failed" ? <RotateCcw size={18} /> : <Play size={18} />}
+                    </button>
+                    <button className="icon-button delete-button" title="删除任务" onClick={() => deleteTask(task)}>
+                      <Trash2 size={17} />
+                    </button>
+                  </div>
                 </article>
               );
             })}

@@ -1,11 +1,13 @@
 use crate::{
     http_download::update_progress,
     models::{DownloadTask, TorrentFileInfo, TorrentMetadata},
+    power::cancel_pending_shutdown,
     state::{ManagedTask, Manager},
 };
 use lava_torrent::torrent::v1::Torrent;
+use librqbit::api::TorrentIdOrHash;
 use librqbit::{
-    dht::PersistentDhtConfig, AddTorrent, AddTorrentOptions, Session, SessionOptions,
+    dht::PersistentDhtConfig, AddTorrent, AddTorrentOptions, Api, Session, SessionOptions,
     SessionPersistenceConfig, TorrentStatsState,
 };
 use std::{
@@ -88,6 +90,20 @@ pub(crate) async fn create_torrent_download(
         .await
         .map_err(|error| format!("无法创建种子下载文件夹：{error}"))?;
     let session = get_or_create_session(&manager, target.clone()).await?;
+    let torrent_id = TorrentIdOrHash::try_from(meta.info_hash.as_str())
+        .map_err(|error| format!("种子哈希无效：{error}"))?;
+    if session.get(torrent_id).is_some() {
+        let details = Api::new(session.clone(), None)
+            .api_torrent_details(torrent_id)
+            .map_err(|error| format!("读取已有 BT 任务失败：{error}"))?;
+        if !paths_match(&details.output_folder, &target) {
+            session
+                .delete(torrent_id, false)
+                .await
+                .map_err(|error| format!("切换种子下载目录失败：{error}"))?;
+            remove_torrent_from_manager(&manager, meta.info_hash.as_str()).await;
+        }
+    }
     let bytes = fs::read(&path).await.map_err(|error| error.to_string())?;
     let handle = session
         .add_torrent(
@@ -127,6 +143,7 @@ pub(crate) async fn create_torrent_download(
             cancellation: CancellationToken::new(),
         },
     );
+    cancel_pending_shutdown(&manager);
     manager.bt.write().await.insert(id.clone(), handle.clone());
 
     let manager = manager.inner().clone();
@@ -246,6 +263,47 @@ fn smooth_speed(previous: u64, current: u64) -> u64 {
         (0, current) => current,
         (previous, 0) => previous.saturating_mul(3) / 4,
         (previous, current) => ((previous as f64 * 0.65) + (current as f64 * 0.35)).round() as u64,
+    }
+}
+
+async fn remove_torrent_from_manager(manager: &Manager, info_hash: &str) {
+    let ids = {
+        let torrents = manager.bt.read().await;
+        torrents
+            .iter()
+            .filter(|(_, handle)| handle.info_hash().as_string() == info_hash)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>()
+    };
+    if ids.is_empty() {
+        return;
+    }
+    let mut torrents = manager.bt.write().await;
+    let mut tasks = manager.tasks.write().await;
+    for id in ids {
+        torrents.remove(&id);
+        if let Some(task) = tasks.remove(&id) {
+            task.cancellation.cancel();
+        }
+    }
+}
+
+fn paths_match(existing: &str, requested: &PathBuf) -> bool {
+    let existing = PathBuf::from(existing);
+    match (existing.canonicalize(), requested.canonicalize()) {
+        (Ok(existing), Ok(requested)) => existing == requested,
+        _ => {
+            #[cfg(target_os = "windows")]
+            {
+                existing
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&requested.to_string_lossy())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                existing == *requested
+            }
+        }
     }
 }
 

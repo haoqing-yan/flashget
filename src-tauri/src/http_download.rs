@@ -1,5 +1,6 @@
 use crate::{
     models::DownloadTask,
+    power::{cancel_pending_shutdown, schedule_shutdown_if_ready},
     state::{ManagedTask, Manager},
 };
 use futures_util::StreamExt;
@@ -101,6 +102,7 @@ pub(crate) async fn create_download(
             cancellation: cancellation.clone(),
         },
     );
+    cancel_pending_shutdown(&manager);
     spawn_download(app, manager.inner().clone(), id, cancellation);
     Ok(task)
 }
@@ -160,6 +162,34 @@ pub(crate) async fn resume_download(
         task.cancellation = cancellation.clone();
     }
     spawn_download(app, manager.inner().clone(), id, cancellation);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn delete_download(manager: State<'_, Manager>, id: String) -> Result<(), String> {
+    let bt_handle = { manager.bt.read().await.get(&id).cloned() };
+    if let Some(handle) = bt_handle {
+        let session = manager
+            .bt_session
+            .lock()
+            .await
+            .clone()
+            .ok_or("BT 会话未启动")?;
+        session
+            .delete(handle.id().into(), false)
+            .await
+            .map_err(|error| format!("删除 BT 任务失败：{error}"))?;
+        manager.bt.write().await.remove(&id);
+    }
+
+    let task = manager
+        .tasks
+        .write()
+        .await
+        .remove(&id)
+        .ok_or("找不到下载任务")?;
+    task.cancellation.cancel();
+    cancel_pending_shutdown(&manager);
     Ok(())
 }
 
@@ -374,6 +404,9 @@ pub(crate) async fn update_progress(
     };
     if let Some(payload) = payload {
         let _ = app.emit("download-progress", payload);
+    }
+    if status == "completed" {
+        schedule_shutdown_if_ready(app, manager).await;
     }
 }
 
