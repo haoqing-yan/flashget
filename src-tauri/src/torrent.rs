@@ -4,7 +4,7 @@ use crate::{
     state::{ManagedTask, Manager},
 };
 use lava_torrent::torrent::v1::Torrent;
-use librqbit::{AddTorrent, AddTorrentOptions, PeerConnectionOptions, Session, SessionOptions};
+use librqbit::{AddTorrent, AddTorrentOptions, Session, SessionOptions};
 use librqbit_dht::PersistentDhtConfig;
 use std::{path::PathBuf, time::Duration};
 use tauri::{AppHandle, State};
@@ -90,6 +90,7 @@ pub(crate) async fn create_torrent_download(
             Some(AddTorrentOptions {
                 overwrite: true,
                 output_folder: Some(target.to_string_lossy().into_owned()),
+                force_tracker_interval: Some(Duration::from_secs(10 * 60)),
                 ..Default::default()
             }),
         )
@@ -108,6 +109,8 @@ pub(crate) async fn create_torrent_download(
         total: meta.total_size,
         speed: 0,
         eta_seconds: None,
+        peers_connected: 0,
+        peers_seen: 0,
         status: "downloading".into(),
         error: None,
     };
@@ -130,6 +133,18 @@ pub(crate) async fn create_torrent_download(
                 .as_ref()
                 .map(|live| (live.download_speed.mbps * 1024.0 * 1024.0) as u64)
                 .unwrap_or(0);
+            let (peers_connected, peers_seen) = stats
+                .live
+                .as_ref()
+                .map(|live| {
+                    let peers = &live.snapshot.peer_stats;
+                    (peers.live, peers.seen)
+                })
+                .unwrap_or_default();
+            if let Some(task) = manager.tasks.write().await.get_mut(&id) {
+                task.info.peers_connected = peers_connected;
+                task.info.peers_seen = peers_seen;
+            }
             let status = if stats.finished {
                 "completed"
             } else if stats.error.is_some() {
@@ -175,19 +190,14 @@ async fn get_or_create_session(
     let options = SessionOptions {
         disable_dht_persistence: false,
         dht_config: Some(PersistentDhtConfig {
-            dump_interval: Some(Duration::from_secs(30)),
+            dump_interval: Some(Duration::from_secs(5 * 60)),
             config_filename: Some(config_dir.join("dht.json")),
         }),
-        listen_port_range: Some(49152..65535),
+        listen_port_range: Some(49152..49162),
         enable_upnp_port_forwarding: true,
         fastresume: true,
         defer_writes_up_to: Some(256),
-        concurrent_init_limit: Some(8),
-        peer_opts: Some(PeerConnectionOptions {
-            connect_timeout: Some(Duration::from_secs(8)),
-            read_write_timeout: Some(Duration::from_secs(30)),
-            keep_alive_interval: Some(Duration::from_secs(60)),
-        }),
+        concurrent_init_limit: Some(4),
         ..Default::default()
     };
     let session = Session::new_with_opts(target, options)

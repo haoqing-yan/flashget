@@ -60,7 +60,7 @@ function App() {
   const [showDialog, setShowDialog] = useState(false);
   const [url, setUrl] = useState("");
   const [destination, setDestination] = useState("");
-  const [connections, setConnections] = useState(8);
+  const [connections, setConnections] = useState(16);
   const [parsingTorrent, setParsingTorrent] = useState(false);
 
   useEffect(() => {
@@ -199,6 +199,7 @@ function App() {
                     <div className="task-meta">
                       <span>{formatBytes(task.downloaded)} / {formatBytes(task.total)}</span>
                       <span>{progress.toFixed(1)}%</span>
+                      {task.peersSeen > 0 && <span>Peer {task.peersConnected} / 已发现 {task.peersSeen}</span>}
                       {task.status === "downloading" && <span className="speed">{formatBytes(task.speed)}/s</span>}
                       {task.status === "downloading" && task.etaSeconds != null && (
                         <span className="eta">预计 {completionTime(task.etaSeconds)} 完成 · 剩余 {formatEta(task.etaSeconds)}</span>
@@ -224,7 +225,7 @@ function App() {
             <div className="dialog-head"><div><h2>新建下载任务</h2><p>支持 HTTP/HTTPS 与断点续传</p></div><button type="button" className="icon-button" onClick={() => setShowDialog(false)}><X size={19} /></button></div>
             <label>下载链接<textarea autoFocus value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/file.zip" required /></label>
             <label>保存目录（留空使用系统下载目录）<div className="input-icon"><FolderOpen size={18} /><input value={destination} onChange={(event) => setDestination(event.target.value)} placeholder="默认下载目录" /></div></label>
-            <label>并发连接数 <strong>{connections}</strong><input type="range" min="1" max="16" value={connections} onChange={(event) => setConnections(Number(event.target.value))} /></label>
+            <label>并发连接数 <strong>{connections}</strong><input type="range" min="1" max="32" value={connections} onChange={(event) => setConnections(Number(event.target.value))} /></label>
             <div className="dialog-actions"><button type="button" className="secondary" onClick={() => setShowDialog(false)}>取消</button><button className="primary" type="submit"><Download size={18} />立即下载</button></div>
           </form>
         </div>

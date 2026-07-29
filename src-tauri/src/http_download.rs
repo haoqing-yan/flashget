@@ -11,11 +11,14 @@ use std::{
 use tauri::{AppHandle, Emitter, State};
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, BufWriter},
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
+
+const MAX_HTTP_CONNECTIONS: usize = 32;
+const MIN_BYTES_PER_CONNECTION: u64 = 8 * 1024 * 1024;
 
 #[tauri::command]
 pub(crate) async fn list_tasks(manager: State<'_, Manager>) -> Result<Vec<DownloadTask>, String> {
@@ -84,6 +87,8 @@ pub(crate) async fn create_download(
         total,
         speed: 0,
         eta_seconds: None,
+        peers_connected: 0,
+        peers_seen: 0,
         status: "downloading".into(),
         error: None,
     };
@@ -92,7 +97,7 @@ pub(crate) async fn create_download(
         id.clone(),
         ManagedTask {
             info: task.clone(),
-            connections: connections.clamp(1, 16),
+            connections: effective_connections(total, connections),
             cancellation: cancellation.clone(),
         },
     );
@@ -270,12 +275,13 @@ async fn download_part(
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err("服务器不支持多连接分片下载（Range）".into());
     }
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .await
         .map_err(|error| format!("无法写入临时文件：{error}"))?;
+    let mut file = BufWriter::with_capacity(1024 * 1024, file);
     let mut stream = response.bytes_stream();
     while let Some(chunk) = tokio::select! {
         _ = cancellation.cancelled() => return Ok(()),
@@ -285,6 +291,9 @@ async fn download_part(
             .await
             .map_err(|error| format!("写入文件失败：{error}"))?;
     }
+    file.flush()
+        .await
+        .map_err(|error| format!("无法刷新下载数据：{error}"))?;
     Ok(())
 }
 
@@ -385,27 +394,23 @@ fn estimate_eta(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::estimate_eta;
-
-    #[test]
-    fn calculates_and_smooths_eta() {
-        assert_eq!(estimate_eta(None, 500, 1_000, 100, "downloading"), Some(5));
-        assert_eq!(
-            estimate_eta(Some(10), 500, 1_000, 100, "downloading"),
-            Some(9)
-        );
-        assert_eq!(estimate_eta(Some(10), 500, 1_000, 0, "downloading"), None);
-    }
-}
-
 fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent("FlashGet/0.1")
         .redirect(reqwest::redirect::Policy::limited(10))
+        .connect_timeout(Duration::from_secs(10))
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(MAX_HTTP_CONNECTIONS)
         .build()
         .map_err(|error| error.to_string())
+}
+
+fn effective_connections(total: u64, requested: usize) -> usize {
+    let useful = total
+        .div_ceil(MIN_BYTES_PER_CONNECTION)
+        .clamp(1, MAX_HTTP_CONNECTIONS as u64) as usize;
+    requested.clamp(1, MAX_HTTP_CONNECTIONS).min(useful)
 }
 
 fn part_path(target: &Path, index: usize) -> PathBuf {
@@ -427,5 +432,27 @@ fn friendly_error(error: reqwest::Error) -> String {
         "无法连接下载服务器".into()
     } else {
         error.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{effective_connections, estimate_eta};
+
+    #[test]
+    fn calculates_and_smooths_eta() {
+        assert_eq!(estimate_eta(None, 500, 1_000, 100, "downloading"), Some(5));
+        assert_eq!(
+            estimate_eta(Some(10), 500, 1_000, 100, "downloading"),
+            Some(9)
+        );
+        assert_eq!(estimate_eta(Some(10), 500, 1_000, 0, "downloading"), None);
+    }
+
+    #[test]
+    fn adapts_connections_to_download_size() {
+        assert_eq!(effective_connections(4 * 1024 * 1024, 32), 1);
+        assert_eq!(effective_connections(80 * 1024 * 1024, 32), 10);
+        assert_eq!(effective_connections(1024 * 1024 * 1024, 64), 32);
     }
 }

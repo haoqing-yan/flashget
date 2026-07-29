@@ -14,6 +14,8 @@ export interface DownloadTask {
   total: number;
   speed: number;
   etaSeconds: number | null;
+  peersConnected: number;
+  peersSeen: number;
   status: TaskStatus;
   error?: string;
 }
@@ -23,6 +25,8 @@ export interface ProgressPayload {
   downloaded: number;
   total: number;
   speed: number;
+  peersConnected: number;
+  peersSeen: number;
   status: TaskStatus;
   error?: string;
 }

@@ -11,6 +11,8 @@ pub(crate) struct DownloadTask {
     pub(crate) total: u64,
     pub(crate) speed: u64,
     pub(crate) eta_seconds: Option<u64>,
+    pub(crate) peers_connected: usize,
+    pub(crate) peers_seen: usize,
     pub(crate) status: String,
     pub(crate) error: Option<String>,
 }
