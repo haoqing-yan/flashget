@@ -1,5 +1,5 @@
+use librqbit::dht::PersistentDhtConfig;
 use librqbit::{AddTorrent, AddTorrentOptions, PeerConnectionOptions, Session, SessionOptions};
-use librqbit_dht::PersistentDhtConfig;
 use std::{path::PathBuf, time::Duration};
 
 #[tokio::main]

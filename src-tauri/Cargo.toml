@@ -1,6 +1,6 @@
 [package]
 name = "flashget"
-version = "0.1.3"
+version = "0.1.4"
 description = "A fast cross-platform download manager"
 authors = ["FlashGet Contributors"]
 edition = "2021"
@@ -27,5 +27,4 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 dirs = "6"
 lava_torrent = "0.11"
-librqbit = "8.1.1"
-librqbit-dht = "5.3.1"
+librqbit = { version = "8.1.1", default-features = false, features = ["rust-tls"] }

@@ -4,8 +4,10 @@ use crate::{
     state::{ManagedTask, Manager},
 };
 use lava_torrent::torrent::v1::Torrent;
-use librqbit::{AddTorrent, AddTorrentOptions, Session, SessionOptions, TorrentStatsState};
-use librqbit_dht::PersistentDhtConfig;
+use librqbit::{
+    dht::PersistentDhtConfig, AddTorrent, AddTorrentOptions, Session, SessionOptions,
+    SessionPersistenceConfig, TorrentStatsState,
+};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -225,6 +227,9 @@ async fn get_or_create_session(
         listen_port_range: Some(49152..49162),
         enable_upnp_port_forwarding: true,
         fastresume: true,
+        persistence: Some(SessionPersistenceConfig::Json {
+            folder: Some(config_dir.join("session")),
+        }),
         defer_writes_up_to: Some(256),
         concurrent_init_limit: Some(4),
         ..Default::default()
