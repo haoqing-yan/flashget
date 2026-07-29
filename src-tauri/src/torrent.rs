@@ -1,0 +1,240 @@
+use crate::{
+    http_download::update_progress,
+    models::{DownloadTask, TorrentFileInfo, TorrentMetadata},
+    state::{ManagedTask, Manager},
+};
+use lava_torrent::torrent::v1::Torrent;
+use librqbit::{AddTorrent, AddTorrentOptions, PeerConnectionOptions, Session, SessionOptions};
+use librqbit_dht::PersistentDhtConfig;
+use std::{path::PathBuf, time::Duration};
+use tauri::{AppHandle, State};
+use tokio::fs;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+#[tauri::command]
+pub(crate) fn parse_torrent(path: String) -> Result<TorrentMetadata, String> {
+    let source = PathBuf::from(&path);
+    if source.extension().and_then(|extension| extension.to_str()) != Some("torrent") {
+        return Err("请选择扩展名为 .torrent 的文件".into());
+    }
+    let torrent = Torrent::read_from_file(&source)
+        .map_err(|error| format!("无效或损坏的种子文件：{error}"))?;
+    if torrent.length < 0 || torrent.piece_length <= 0 {
+        return Err("种子中包含无效的文件大小或分片大小".into());
+    }
+
+    let files = match &torrent.files {
+        Some(items) => items
+            .iter()
+            .map(|file| {
+                if file.length < 0 {
+                    return Err("种子文件列表中包含无效大小".to_string());
+                }
+                Ok(TorrentFileInfo {
+                    path: file.path.to_string_lossy().into_owned(),
+                    length: file.length as u64,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        None => vec![TorrentFileInfo {
+            path: torrent.name.clone(),
+            length: torrent.length as u64,
+        }],
+    };
+
+    let mut trackers = torrent.announce.iter().cloned().collect::<Vec<_>>();
+    if let Some(tiers) = &torrent.announce_list {
+        for tracker in tiers.iter().flatten() {
+            if !trackers.contains(tracker) {
+                trackers.push(tracker.clone());
+            }
+        }
+    }
+
+    Ok(TorrentMetadata {
+        name: torrent.name.clone(),
+        info_hash: torrent.info_hash(),
+        total_size: torrent.length as u64,
+        piece_length: torrent.piece_length as u64,
+        piece_count: torrent.pieces.len(),
+        trackers,
+        files,
+        source_path: source.to_string_lossy().into_owned(),
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn create_torrent_download(
+    app: AppHandle,
+    manager: State<'_, Manager>,
+    path: String,
+    destination: Option<String>,
+) -> Result<DownloadTask, String> {
+    let meta = parse_torrent(path.clone())?;
+    let base_dir = destination
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::download_dir)
+        .ok_or("无法确定下载目录")?;
+    let folder_name = safe_folder_name(&meta.name, &meta.info_hash);
+    let target = base_dir.join(folder_name);
+    fs::create_dir_all(&target)
+        .await
+        .map_err(|error| format!("无法创建种子下载文件夹：{error}"))?;
+    let session = get_or_create_session(&manager, target.clone()).await?;
+    let bytes = fs::read(&path).await.map_err(|error| error.to_string())?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(bytes),
+            Some(AddTorrentOptions {
+                overwrite: true,
+                output_folder: Some(target.to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|error| format!("启动 BT 下载失败：{error}"))?
+        .into_handle()
+        .ok_or("无法创建 BT 下载会话")?;
+
+    let id = Uuid::new_v4().to_string();
+    let task = DownloadTask {
+        id: id.clone(),
+        url: path,
+        file_name: meta.name,
+        destination: target.to_string_lossy().into_owned(),
+        downloaded: 0,
+        total: meta.total_size,
+        speed: 0,
+        eta_seconds: None,
+        status: "downloading".into(),
+        error: None,
+    };
+    manager.tasks.write().await.insert(
+        id.clone(),
+        ManagedTask {
+            info: task.clone(),
+            connections: 0,
+            cancellation: CancellationToken::new(),
+        },
+    );
+    manager.bt.write().await.insert(id.clone(), handle.clone());
+
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let stats = handle.stats();
+            let speed = stats
+                .live
+                .as_ref()
+                .map(|live| (live.download_speed.mbps * 1024.0 * 1024.0) as u64)
+                .unwrap_or(0);
+            let status = if stats.finished {
+                "completed"
+            } else if stats.error.is_some() {
+                "failed"
+            } else if handle.is_paused() {
+                "paused"
+            } else {
+                "downloading"
+            };
+            update_progress(
+                &app,
+                &manager,
+                &id,
+                stats.progress_bytes,
+                stats.total_bytes,
+                speed,
+                status,
+            )
+            .await;
+            if stats.finished || stats.error.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+    Ok(task)
+}
+
+async fn get_or_create_session(
+    manager: &Manager,
+    target: PathBuf,
+) -> Result<std::sync::Arc<Session>, String> {
+    let mut current = manager.bt_session.lock().await;
+    if let Some(session) = current.as_ref() {
+        return Ok(session.clone());
+    }
+    let config_dir = dirs::config_dir()
+        .map(|path| path.join("flashget"))
+        .ok_or("无法确定应用配置目录")?;
+    fs::create_dir_all(&config_dir)
+        .await
+        .map_err(|error| format!("无法创建应用配置目录：{error}"))?;
+    let options = SessionOptions {
+        disable_dht_persistence: false,
+        dht_config: Some(PersistentDhtConfig {
+            dump_interval: Some(Duration::from_secs(30)),
+            config_filename: Some(config_dir.join("dht.json")),
+        }),
+        listen_port_range: Some(49152..65535),
+        enable_upnp_port_forwarding: true,
+        fastresume: true,
+        defer_writes_up_to: Some(256),
+        concurrent_init_limit: Some(8),
+        peer_opts: Some(PeerConnectionOptions {
+            connect_timeout: Some(Duration::from_secs(8)),
+            read_write_timeout: Some(Duration::from_secs(30)),
+            keep_alive_interval: Some(Duration::from_secs(60)),
+        }),
+        ..Default::default()
+    };
+    let session = Session::new_with_opts(target, options)
+        .await
+        .map_err(|error| format!("初始化 BT 网络失败：{error}"))?;
+    *current = Some(session.clone());
+    Ok(session)
+}
+
+fn safe_folder_name(name: &str, info_hash: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim().trim_matches(['.', ' ']);
+    if sanitized.is_empty() {
+        format!("torrent-{}", &info_hash[..info_hash.len().min(8)])
+    } else {
+        sanitized.chars().take(120).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_folder_name;
+
+    #[test]
+    fn sanitizes_cross_platform_folder_names() {
+        assert_eq!(
+            safe_folder_name("movie: part/one?.mkv", "1234567890"),
+            "movie_ part_one_.mkv"
+        );
+    }
+
+    #[test]
+    fn falls_back_when_name_has_no_usable_characters() {
+        assert_eq!(safe_folder_name("... ", "1234567890"), "torrent-12345678");
+    }
+}

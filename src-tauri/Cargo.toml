@@ -1,0 +1,31 @@
+[package]
+name = "flashget"
+version = "0.1.0"
+description = "A fast cross-platform download manager"
+authors = ["FlashGet Contributors"]
+edition = "2021"
+
+[lib]
+name = "flashget_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "sync", "time", "macros"] }
+tokio-util = "0.7"
+reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+dirs = "6"
+lava_torrent = "0.11"
+librqbit = "8.1.1"
+librqbit-dht = "5.3.1"
