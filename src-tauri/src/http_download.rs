@@ -7,6 +7,10 @@ use futures_util::StreamExt;
 use reqwest::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, RANGE};
 use std::{
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, State};
@@ -19,7 +23,10 @@ use url::Url;
 use uuid::Uuid;
 
 const MAX_HTTP_CONNECTIONS: usize = 32;
-const MIN_BYTES_PER_CONNECTION: u64 = 8 * 1024 * 1024;
+const MIN_BYTES_PER_CONNECTION: u64 = 2 * 1024 * 1024;
+const HTTP_WRITE_BUFFER_SIZE: usize = 1024 * 1024;
+const MERGE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const MAX_PART_RETRIES: usize = 3;
 
 #[tauri::command]
 pub(crate) async fn list_tasks(manager: State<'_, Manager>) -> Result<Vec<DownloadTask>, String> {
@@ -237,6 +244,9 @@ async fn run_download(
     }
     let chunk_size = total.div_ceil(connections as u64);
     let client = http_client()?;
+    let downloaded_bytes = Arc::new(AtomicU64::new(
+        count_parts(&target, connections).await.min(total),
+    ));
     let mut handles = Vec::new();
     for index in 0..connections {
         let start = index as u64 * chunk_size;
@@ -251,16 +261,17 @@ async fn run_download(
             start,
             end,
             cancellation.clone(),
+            downloaded_bytes.clone(),
         )));
     }
 
-    let mut last_bytes = 0;
+    let mut last_bytes = downloaded_bytes.load(Ordering::Relaxed);
     let mut last_time = Instant::now();
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => return Ok(()),
             _ = tokio::time::sleep(Duration::from_millis(350)) => {
-                let downloaded = count_parts(&target, handles.len()).await;
+                let downloaded = downloaded_bytes.load(Ordering::Relaxed).min(total);
                 let elapsed = last_time.elapsed().as_secs_f64();
                 let speed = ((downloaded.saturating_sub(last_bytes)) as f64 / elapsed) as u64;
                 last_bytes = downloaded;
@@ -287,11 +298,44 @@ async fn download_part(
     start: u64,
     end: u64,
     cancellation: CancellationToken,
+    downloaded_bytes: Arc<AtomicU64>,
 ) -> Result<(), String> {
-    let existing = fs::metadata(&path)
+    let mut last_error = None;
+    for attempt in 0..=MAX_PART_RETRIES {
+        match download_part_attempt(
+            &client,
+            &url,
+            &path,
+            start,
+            end,
+            &cancellation,
+            &downloaded_bytes,
+        )
         .await
-        .map(|meta| meta.len())
-        .unwrap_or(0);
+        {
+            Ok(()) => return Ok(()),
+            Err(_) if cancellation.is_cancelled() => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < MAX_PART_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "分片下载失败".into()))
+}
+
+async fn download_part_attempt(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    start: u64,
+    end: u64,
+    cancellation: &CancellationToken,
+    downloaded_bytes: &AtomicU64,
+) -> Result<(), String> {
+    let existing = fs::metadata(path).await.map(|meta| meta.len()).unwrap_or(0);
     let expected = end - start + 1;
     if existing >= expected {
         return Ok(());
@@ -311,35 +355,65 @@ async fn download_part(
         .open(path)
         .await
         .map_err(|error| format!("无法写入临时文件：{error}"))?;
-    let mut file = BufWriter::with_capacity(1024 * 1024, file);
+    let mut file = BufWriter::with_capacity(HTTP_WRITE_BUFFER_SIZE, file);
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = tokio::select! {
-        _ = cancellation.cancelled() => return Ok(()),
-        next = stream.next() => next
-    } {
-        file.write_all(&chunk.map_err(friendly_error)?)
+    loop {
+        let next = tokio::select! {
+            _ = cancellation.cancelled() => {
+                file.flush()
+                    .await
+                    .map_err(|error| format!("无法刷新下载数据：{error}"))?;
+                return Ok(());
+            },
+            next = stream.next() => next
+        };
+        let Some(chunk) = next else {
+            break;
+        };
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                file.flush()
+                    .await
+                    .map_err(|flush_error| format!("无法刷新下载数据：{flush_error}"))?;
+                return Err(friendly_error(error));
+            }
+        };
+        file.write_all(&chunk)
             .await
             .map_err(|error| format!("写入文件失败：{error}"))?;
+        downloaded_bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
     }
     file.flush()
         .await
         .map_err(|error| format!("无法刷新下载数据：{error}"))?;
+    drop(file);
+    let actual = fs::metadata(path)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if actual < expected {
+        return Err(format!(
+            "分片接收不完整：期望 {expected} 字节，实际 {actual} 字节"
+        ));
+    }
     Ok(())
 }
 
 async fn merge_parts(target: &Path, count: usize, total: u64) -> Result<(), String> {
     let temp_target = target.with_extension("flashget");
-    let mut output = File::create(&temp_target)
+    let output = File::create(&temp_target)
         .await
         .map_err(|error| format!("无法创建目标文件：{error}"))?;
+    let mut output = BufWriter::with_capacity(MERGE_BUFFER_SIZE, output);
     let mut written = 0;
+    let mut buffer = vec![0_u8; MERGE_BUFFER_SIZE];
     for index in 0..count {
         let part = part_path(target, index);
         if !part.exists() {
             continue;
         }
         let mut input = File::open(&part).await.map_err(|error| error.to_string())?;
-        let mut buffer = vec![0_u8; 1024 * 1024];
         loop {
             let size = input
                 .read(&mut buffer)
@@ -356,6 +430,7 @@ async fn merge_parts(target: &Path, count: usize, total: u64) -> Result<(), Stri
         }
     }
     output.flush().await.map_err(|error| error.to_string())?;
+    drop(output);
     if written != total {
         return Err(format!(
             "文件合并校验失败：期望 {total} 字节，实际 {written} 字节"
@@ -432,8 +507,10 @@ fn http_client() -> Result<reqwest::Client, String> {
         .user_agent("FlashGet/0.1")
         .redirect(reqwest::redirect::Policy::limited(10))
         .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(30))
         .tcp_keepalive(Duration::from_secs(30))
         .tcp_nodelay(true)
+        .http1_only()
         .pool_max_idle_per_host(MAX_HTTP_CONNECTIONS)
         .build()
         .map_err(|error| error.to_string())
@@ -470,7 +547,7 @@ fn friendly_error(error: reqwest::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_connections, estimate_eta};
+    use super::{effective_connections, estimate_eta, merge_parts, part_path};
 
     #[test]
     fn calculates_and_smooths_eta() {
@@ -484,8 +561,26 @@ mod tests {
 
     #[test]
     fn adapts_connections_to_download_size() {
-        assert_eq!(effective_connections(4 * 1024 * 1024, 32), 1);
-        assert_eq!(effective_connections(80 * 1024 * 1024, 32), 10);
+        assert_eq!(effective_connections(1024 * 1024, 32), 1);
+        assert_eq!(effective_connections(4 * 1024 * 1024, 32), 2);
+        assert_eq!(effective_connections(80 * 1024 * 1024, 32), 32);
         assert_eq!(effective_connections(1024 * 1024 * 1024, 64), 32);
+    }
+
+    #[tokio::test]
+    async fn merges_downloaded_parts_in_order() {
+        let target =
+            std::env::temp_dir().join(format!("flashget-merge-test-{}.bin", uuid::Uuid::new_v4()));
+        tokio::fs::write(part_path(&target, 0), b"flash")
+            .await
+            .unwrap();
+        tokio::fs::write(part_path(&target, 1), b"get")
+            .await
+            .unwrap();
+
+        merge_parts(&target, 2, 8).await.unwrap();
+
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"flashget");
+        tokio::fs::remove_file(target).await.unwrap();
     }
 }

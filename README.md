@@ -6,8 +6,8 @@
 
 ## 主要功能
 
-- HTTP/HTTPS Range 分片下载，最多 32 个自适应并发连接
-- `.torrent` 文件解析与下载，支持 Tracker、DHT、Peer 和 UPnP
+- HTTP/HTTPS Range 分片下载，默认启用最多 32 个自适应并发连接
+- `.torrent` 文件解析与下载，支持 Tracker、公共 Tracker 补充、DHT、Peer 和 UPnP
 - 添加种子后确认保存目录，并自动创建种子名称文件夹
 - 实时显示下载进度、实际速度、Peer 数量和预计完成时间
 - 暂停、继续、失败重试和断点续传

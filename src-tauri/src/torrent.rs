@@ -11,6 +11,7 @@ use librqbit::{
     SessionPersistenceConfig, TorrentStatsState,
 };
 use std::{
+    collections::HashSet,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -18,6 +19,17 @@ use tauri::{AppHandle, State};
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+const PUBLIC_TRACKERS: &[&str] = &[
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.publictracker.xyz:6969/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.wildkat.net:6969/announce",
+    "udp://tracker.tryhackx.org:6969/announce",
+    "udp://tracker.qu.ax:6969/announce",
+    "udp://tracker.peerfect.org:6969/announce",
+];
 
 #[tauri::command]
 pub(crate) fn parse_torrent(path: String) -> Result<TorrentMetadata, String> {
@@ -249,6 +261,7 @@ async fn get_or_create_session(
         }),
         defer_writes_up_to: Some(256),
         concurrent_init_limit: Some(4),
+        trackers: public_trackers(),
         ..Default::default()
     };
     let session = Session::new_with_opts(target, options)
@@ -256,6 +269,13 @@ async fn get_or_create_session(
         .map_err(|error| format!("初始化 BT 网络失败：{error}"))?;
     *current = Some(session.clone());
     Ok(session)
+}
+
+fn public_trackers() -> HashSet<url::Url> {
+    PUBLIC_TRACKERS
+        .iter()
+        .filter_map(|tracker| url::Url::parse(tracker).ok())
+        .collect()
 }
 
 fn smooth_speed(previous: u64, current: u64) -> u64 {
@@ -333,7 +353,7 @@ fn safe_folder_name(name: &str, info_hash: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_folder_name, smooth_speed};
+    use super::{public_trackers, safe_folder_name, smooth_speed, PUBLIC_TRACKERS};
 
     #[test]
     fn sanitizes_cross_platform_folder_names() {
@@ -353,5 +373,10 @@ mod tests {
         assert_eq!(smooth_speed(0, 10_000), 10_000);
         assert_eq!(smooth_speed(10_000, 20_000), 13_500);
         assert_eq!(smooth_speed(10_000, 0), 7_500);
+    }
+
+    #[test]
+    fn parses_all_public_trackers() {
+        assert_eq!(public_trackers().len(), PUBLIC_TRACKERS.len());
     }
 }

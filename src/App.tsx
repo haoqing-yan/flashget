@@ -64,7 +64,7 @@ function App() {
   const [showDialog, setShowDialog] = useState(false);
   const [url, setUrl] = useState("");
   const [destination, setDestination] = useState("");
-  const [connections, setConnections] = useState(16);
+  const [connections, setConnections] = useState(32);
   const [parsingTorrent, setParsingTorrent] = useState(false);
   const [taskFilter, setTaskFilter] = useState<TaskFilter>("all");
   const [shutdownWhenDone, setShutdownWhenDone] = useState(false);
