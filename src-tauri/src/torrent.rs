@@ -20,6 +20,7 @@ use tokio::fs;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+const TRACKER_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60);
 const PUBLIC_TRACKERS: &[&str] = &[
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.demonii.com:1337/announce",
@@ -123,7 +124,7 @@ pub(crate) async fn create_torrent_download(
             Some(AddTorrentOptions {
                 overwrite: true,
                 output_folder: Some(target.to_string_lossy().into_owned()),
-                force_tracker_interval: Some(Duration::from_secs(10 * 60)),
+                force_tracker_interval: Some(TRACKER_REFRESH_INTERVAL),
                 ..Default::default()
             }),
         )

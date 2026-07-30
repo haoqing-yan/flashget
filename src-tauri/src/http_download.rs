@@ -8,7 +8,7 @@ use reqwest::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, RANGE};
 use std::{
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 const MAX_HTTP_CONNECTIONS: usize = 32;
 const MIN_BYTES_PER_CONNECTION: u64 = 2 * 1024 * 1024;
+const SEGMENTS_PER_CONNECTION: usize = 8;
 const HTTP_WRITE_BUFFER_SIZE: usize = 1024 * 1024;
 const MERGE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const MAX_PART_RETRIES: usize = 3;
@@ -242,24 +243,23 @@ async fn run_download(
     if total == 0 {
         return Err("服务器没有提供文件大小，暂时无法进行分片下载".into());
     }
-    let chunk_size = total.div_ceil(connections as u64);
+    let segments = segment_count(total, connections);
+    let segment_size = total.div_ceil(segments as u64);
     let client = http_client()?;
     let downloaded_bytes = Arc::new(AtomicU64::new(
-        count_parts(&target, connections).await.min(total),
+        count_parts(&target, segments).await.min(total),
     ));
+    let next_segment = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
-    for index in 0..connections {
-        let start = index as u64 * chunk_size;
-        if start >= total {
-            break;
-        }
-        let end = ((index as u64 + 1) * chunk_size - 1).min(total - 1);
-        handles.push(tokio::spawn(download_part(
+    for _ in 0..connections {
+        handles.push(tokio::spawn(download_worker(
             client.clone(),
             url.clone(),
-            part_path(&target, index),
-            start,
-            end,
+            target.clone(),
+            total,
+            segments,
+            segment_size,
+            next_segment.clone(),
             cancellation.clone(),
             downloaded_bytes.clone(),
         )));
@@ -286,9 +286,44 @@ async fn run_download(
     for handle in handles {
         handle.await.map_err(|error| error.to_string())??;
     }
-    merge_parts(&target, connections, total).await?;
+    merge_parts(&target, segments, total).await?;
     update_progress(app, manager, id, total, total, 0, "completed").await;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_worker(
+    client: reqwest::Client,
+    url: String,
+    target: PathBuf,
+    total: u64,
+    segments: usize,
+    segment_size: u64,
+    next_segment: Arc<AtomicUsize>,
+    cancellation: CancellationToken,
+    downloaded_bytes: Arc<AtomicU64>,
+) -> Result<(), String> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
+        let index = next_segment.fetch_add(1, Ordering::Relaxed);
+        if index >= segments {
+            return Ok(());
+        }
+        let start = index as u64 * segment_size;
+        let end = ((index as u64 + 1) * segment_size - 1).min(total - 1);
+        download_part(
+            client.clone(),
+            url.clone(),
+            part_path(&target, index),
+            start,
+            end,
+            cancellation.clone(),
+            downloaded_bytes.clone(),
+        )
+        .await?;
+    }
 }
 
 async fn download_part(
@@ -523,8 +558,21 @@ fn effective_connections(total: u64, requested: usize) -> usize {
     requested.clamp(1, MAX_HTTP_CONNECTIONS).min(useful)
 }
 
+fn segment_count(total: u64, workers: usize) -> usize {
+    let useful = total
+        .div_ceil(MIN_BYTES_PER_CONNECTION)
+        .min(usize::MAX as u64) as usize;
+    workers
+        .saturating_mul(SEGMENTS_PER_CONNECTION)
+        .min(useful)
+        .max(workers)
+}
+
 fn part_path(target: &Path, index: usize) -> PathBuf {
-    PathBuf::from(format!("{}.part.{index}", target.to_string_lossy()))
+    PathBuf::from(format!(
+        "{}.flashget-v2.part.{index}",
+        target.to_string_lossy()
+    ))
 }
 
 fn file_name_from_disposition(value: &str) -> Option<String> {
@@ -547,7 +595,7 @@ fn friendly_error(error: reqwest::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_connections, estimate_eta, merge_parts, part_path};
+    use super::{effective_connections, estimate_eta, merge_parts, part_path, segment_count};
 
     #[test]
     fn calculates_and_smooths_eta() {
@@ -565,6 +613,13 @@ mod tests {
         assert_eq!(effective_connections(4 * 1024 * 1024, 32), 2);
         assert_eq!(effective_connections(80 * 1024 * 1024, 32), 32);
         assert_eq!(effective_connections(1024 * 1024 * 1024, 64), 32);
+    }
+
+    #[test]
+    fn keeps_more_segments_than_workers_for_large_downloads() {
+        assert_eq!(segment_count(4 * 1024 * 1024, 2), 2);
+        assert_eq!(segment_count(80 * 1024 * 1024, 32), 40);
+        assert_eq!(segment_count(1024 * 1024 * 1024, 32), 256);
     }
 
     #[tokio::test]
